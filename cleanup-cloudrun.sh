@@ -9,10 +9,13 @@ set -euo pipefail
 # Usage:
 #   ./cleanup-cloudrun.sh
 #
+# Required:
+#   export GOOGLE_CLOUD_PROJECT=my-project
+#   export SERVICE_NAME=my-service
+#   export REPO_NAME=my-repo
+#
 # Optional:
 #   export KEEP_COUNT=3           # revisions/images to keep (default: 3)
-#   export SERVICE_NAME=trinket   # Cloud Run service name (default: trinket)
-#   export REPO_NAME=trinket      # Artifact Registry repo name (default: trinket)
 #   export DRY_RUN=1              # print what would be deleted without deleting
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -24,11 +27,11 @@ keeping the most recent KEEP_COUNT of each.
 
 Required (set in .env or environment):
   GOOGLE_CLOUD_PROJECT     GCP project ID
+  SERVICE_NAME             Cloud Run service name
+  REPO_NAME                Artifact Registry repo name
 
 Optional:
   KEEP_COUNT               Number of revisions/images to keep (default: 3)
-  SERVICE_NAME             Cloud Run service name (default: trinket)
-  REPO_NAME                Artifact Registry repo name (default: trinket)
   GOOGLE_CLOUD_REGION      Region (default: us-central1)
   DRY_RUN                  Set to 1 to print what would be deleted without deleting
 EOF
@@ -42,8 +45,8 @@ fi
 
 GOOGLE_CLOUD_PROJECT="${GOOGLE_CLOUD_PROJECT:?Set GOOGLE_CLOUD_PROJECT in .env or the environment}"
 GOOGLE_CLOUD_REGION="${GOOGLE_CLOUD_REGION:-us-central1}"
-SERVICE_NAME="${SERVICE_NAME:-trinket}"
-REPO_NAME="${REPO_NAME:-trinket}"
+SERVICE_NAME="${SERVICE_NAME:?Set SERVICE_NAME in .env or the environment}"
+REPO_NAME="${REPO_NAME:?Set REPO_NAME in .env or the environment}"
 KEEP_COUNT="${KEEP_COUNT:-3}"
 DRY_RUN="${DRY_RUN:-0}"
 IMAGE_PATH="${GOOGLE_CLOUD_REGION}-docker.pkg.dev/${GOOGLE_CLOUD_PROJECT}/${REPO_NAME}/${SERVICE_NAME}"

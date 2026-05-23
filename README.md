@@ -73,11 +73,14 @@ image storage from accumulating.
 Configure via `.env` in the same directory or environment variables:
 
 ```bash
+# Required
 GOOGLE_CLOUD_PROJECT=my-project
-GOOGLE_CLOUD_REGION=us-central1   # default
 SERVICE_NAME=my-service
 REPO_NAME=my-repo
-KEEP_COUNT=3
+
+# Optional
+GOOGLE_CLOUD_REGION=us-central1   # default
+KEEP_COUNT=3                       # default
 ```
 
 ---
