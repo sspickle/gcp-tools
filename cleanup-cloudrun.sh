@@ -20,20 +20,24 @@ set -euo pipefail
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   cat <<'EOF'
-Usage: cleanup-cloudrun.sh
+Usage: cleanup-cloudrun.sh [--sweep-repo]
 
 Delete old Cloud Run revisions and Artifact Registry images,
 keeping the most recent KEEP_COUNT of each.
 
-Required (set in .env or environment):
-  GOOGLE_CLOUD_PROJECT     GCP project ID
-  SERVICE_NAME             Cloud Run service name
-  REPO_NAME                Artifact Registry repo name
+Default mode (Cloud Run + Artifact Registry):
+  Required: GOOGLE_CLOUD_PROJECT, SERVICE_NAME, REPO_NAME
+  Optional: KEEP_COUNT (default: 3), GOOGLE_CLOUD_REGION (default: us-central1),
+            IMAGE_NAME (default: SERVICE_NAME, set when AR image name differs from service name)
 
-Optional:
-  KEEP_COUNT               Number of revisions/images to keep (default: 3)
-  GOOGLE_CLOUD_REGION      Region (default: us-central1)
-  DRY_RUN                  Set to 1 to print what would be deleted without deleting
+--sweep-repo mode (legacy Container Registry):
+  Sweeps every image in a GCR repository, keeping the newest KEEP_COUNT
+  versions of each image. Uses gcloud container images (not AR API).
+  Required: REPOSITORY  (e.g. us.gcr.io/my-project)
+  Optional: KEEP_COUNT  (default: 1)
+
+Common:
+  DRY_RUN=1   Print what would be deleted without deleting
 EOF
   exit 0
 fi
@@ -43,13 +47,74 @@ if [[ -f "${SCRIPT_DIR}/.env" ]]; then
   source "${SCRIPT_DIR}/.env"
 fi
 
+# ---------------------------------------------------------------------------
+# --sweep-repo mode: keep newest KEEP_COUNT versions of every image in a
+# legacy Container Registry repository (uses gcloud container images, not AR)
+# ---------------------------------------------------------------------------
+if [[ "${1:-}" == "--sweep-repo" ]]; then
+  REPOSITORY="${REPOSITORY:?Set REPOSITORY (e.g. us.gcr.io/PROJECT) in .env or environment}"
+  KEEP_COUNT="${KEEP_COUNT:-1}"
+  DRY_RUN="${DRY_RUN:-0}"
+
+  [[ "${DRY_RUN}" == "1" ]] && echo "--- DRY RUN — nothing will be deleted ---"
+  echo "Repository: ${REPOSITORY}"
+  echo "Keeping newest ${KEEP_COUNT} version(s) of each image"
+  echo ""
+
+  IMAGE_NAMES=$(gcloud container images list \
+    --repository="${REPOSITORY}" \
+    --format="value(name)" 2>/dev/null || true)
+
+  if [[ -z "${IMAGE_NAMES}" ]]; then
+    echo "No images found in ${REPOSITORY}"
+    exit 0
+  fi
+
+  while IFS= read -r image_url; do
+    image_name="${image_url##*/}"
+    echo "=== ${image_name} ==="
+
+    DIGESTS=$(gcloud container images list-tags "${image_url}" \
+      --sort-by="~timestamp" \
+      --format="value(digest)" 2>/dev/null || true)
+
+    if [[ -z "${DIGESTS}" ]]; then
+      echo "  no versions found"
+      continue
+    fi
+
+    COUNT=0
+    while IFS= read -r digest; do
+      [[ -z "${digest}" ]] && continue
+      COUNT=$((COUNT + 1))
+      # Ensure digest has sha256: prefix for the delete command
+      [[ "${digest}" != sha256:* ]] && digest="sha256:${digest}"
+      if [[ ${COUNT} -le ${KEEP_COUNT} ]]; then
+        echo "  keeping  ${digest:0:19}..."
+      else
+        echo "  deleting ${digest:0:19}..."
+        if [[ "${DRY_RUN}" != "1" ]]; then
+          gcloud container images delete "${image_url}@${digest}" \
+            --force-delete-tags \
+            --quiet 2>/dev/null || echo "    (skipped)"
+        fi
+      fi
+    done <<< "${DIGESTS}"
+  done <<< "${IMAGE_NAMES}"
+
+  echo ""
+  echo "=== Done ==="
+  exit 0
+fi
+
 GOOGLE_CLOUD_PROJECT="${GOOGLE_CLOUD_PROJECT:?Set GOOGLE_CLOUD_PROJECT in .env or the environment}"
 GOOGLE_CLOUD_REGION="${GOOGLE_CLOUD_REGION:-us-central1}"
 SERVICE_NAME="${SERVICE_NAME:?Set SERVICE_NAME in .env or the environment}"
 REPO_NAME="${REPO_NAME:?Set REPO_NAME in .env or the environment}"
 KEEP_COUNT="${KEEP_COUNT:-3}"
 DRY_RUN="${DRY_RUN:-0}"
-IMAGE_PATH="${GOOGLE_CLOUD_REGION}-docker.pkg.dev/${GOOGLE_CLOUD_PROJECT}/${REPO_NAME}/${SERVICE_NAME}"
+IMAGE_NAME="${IMAGE_NAME:-${SERVICE_NAME}}"
+IMAGE_PATH="${GOOGLE_CLOUD_REGION}-docker.pkg.dev/${GOOGLE_CLOUD_PROJECT}/${REPO_NAME}/${IMAGE_NAME}"
 
 if [[ "${DRY_RUN}" == "1" ]]; then
   echo "--- DRY RUN — nothing will be deleted ---"

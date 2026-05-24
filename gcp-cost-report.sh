@@ -38,6 +38,7 @@ DRY_RUN=0
 BILLING_CSV=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    -h|--help)     awk '/^# ==/{f=!f;next} f{sub(/^# ?/,"");print}' "$0"; exit 0 ;;
     --dry-run)     DRY_RUN=1 ;;
     --billing-csv) shift; BILLING_CSV="${1:?--billing-csv requires a file path}" ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -99,15 +100,15 @@ has_api "datastore.googleapis.com"        && HAS_DS=1
 has_api "compute.googleapis.com"          && HAS_CE=1
 
 TYPE_LABEL=""
-[[ $HAS_FIREBASE -eq 1 ]] && TYPE_LABEL+="Firebase "
-[[ $HAS_AR -eq 1 || $HAS_CR -eq 1 ]] && TYPE_LABEL+="Cloud Run/AR "
-[[ $HAS_AE -eq 1 ]] && TYPE_LABEL+="App Engine "
-[[ $HAS_DS -eq 1 ]] && TYPE_LABEL+="Datastore "
-[[ $HAS_CE -eq 1 ]] && TYPE_LABEL+="Compute Engine "
-TYPE_LABEL="${TYPE_LABEL% }"
+[[ $HAS_FIREBASE -eq 1 ]] && TYPE_LABEL+="Firebase,"
+[[ $HAS_AR -eq 1 || $HAS_CR -eq 1 ]] && TYPE_LABEL+="Cloud Run/AR,"
+[[ $HAS_AE -eq 1 ]] && TYPE_LABEL+="App Engine,"
+[[ $HAS_DS -eq 1 ]] && TYPE_LABEL+="Datastore,"
+[[ $HAS_CE -eq 1 ]] && TYPE_LABEL+="Compute Engine,"
+TYPE_LABEL="${TYPE_LABEL%,}"
 TYPE_LABEL="${TYPE_LABEL:-unknown}"
 
-echo -e " ${GREEN}${TYPE_LABEL// /, }${NC}"
+echo -e " ${GREEN}${TYPE_LABEL}${NC}"
 
 # Running totals (bytes = integers; costs = floats via python)
 FB_BYTES=0;        FB_COST="0.00000"
@@ -172,14 +173,20 @@ for r in json.load(sys.stdin):
     name=r['name'].split('/')[-1]
     fmt=r.get('format','?')
     loc=r.get('name','').split('/')[3] if '/locations/' in r.get('name','') else '?'
-    print(f'{name}\t{fmt}\t{loc}')
+    gcr=1 if 'gcr.io' in name else 0
+    print(f'{name}\t{fmt}\t{loc}\t{gcr}')
 " 2>/dev/null || true)
 
   if [[ -z "$REPO_LIST" ]]; then
     note "No repositories found."
   else
-    while IFS=$'\t' read -r repo_name fmt location; do
+    while IFS=$'\t' read -r repo_name fmt location is_gcr; do
       if [[ "$fmt" == "DOCKER" ]]; then
+        if [[ "$is_gcr" == "1" ]]; then
+          printf "    %-42s  legacy Container Registry — sizes stored in GCS (not available via AR API)\n" \
+            "${repo_name} (${location})"
+          continue
+        fi
         IMAGE_PATH="${location}-docker.pkg.dev/${PROJECT}/${repo_name}"
 
         IMAGES_JSON=$(gcloud artifacts docker images list "$IMAGE_PATH" \
@@ -476,6 +483,9 @@ with open(sys.argv[1]) as f:
 rows.sort(reverse=True)
 total = sum(c for c, _, _ in rows)
 
+print()
+print('  NOTE: CSV covers ALL projects in this billing account.')
+print('        Costs here may include projects other than the one being analyzed.')
 print()
 print(f'  {\"Service\":<30}  {\"Cost\":>8}  {\"Change\":>8}')
 print(f'  {\"-\"*30}  {\"-\"*8}  {\"-\"*8}')
