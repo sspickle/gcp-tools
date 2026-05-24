@@ -10,7 +10,7 @@ Two standalone bash scripts for GCP cost visibility and cleanup. No build system
 
 **`gcp-cost-report.sh`** — takes a single GCP project ID, detects enabled APIs (`firebasehosting`, `artifactregistry`, `run`, `appengine`, `datastore`, `compute`), and reports storage usage with estimated costs. Accepts `--billing-csv <file>` to show a ground-truth billing summary from a GCP billing report CSV alongside the per-resource analysis. Uses `python3` inline for float math (avoids `bc`/`awk` portability issues).
 
-**`cleanup-cloudrun.sh`** — deletes old Cloud Run revisions and Artifact Registry Docker images, keeping the newest `KEEP_COUNT`. Reads config from `.env` in the script's directory or environment variables. Requires `GOOGLE_CLOUD_PROJECT` to be set.
+**`cleanup-cloudrun.sh`** — deletes old Cloud Run revisions and Artifact Registry Docker images, keeping the newest `KEEP_COUNT`. Three modes: auto-discover (default, no `SERVICE_NAME`), targeted (`SERVICE_NAME` set), and `--sweep-repo` (legacy GCR). Reads config from `.env` in the script's directory or environment variables.
 
 ## Running
 
@@ -20,22 +20,28 @@ Two standalone bash scripts for GCP cost visibility and cleanup. No build system
 ./gcp-cost-report.sh <project-id> --billing-csv ~/Downloads/billing.csv
 ./gcp-cost-report.sh <project-id> --dry-run
 
-# Cleanup (configure via .env or env vars first)
+# Cleanup — auto-discover all services in a project
+./cleanup-cloudrun.sh my-project
+DRY_RUN=1 ./cleanup-cloudrun.sh my-project
+KEEP_COUNT=5 ./cleanup-cloudrun.sh my-project
+
+# Cleanup — targeted (SERVICE_NAME set in .env)
 ./cleanup-cloudrun.sh
-DRY_RUN=1 ./cleanup-cloudrun.sh
-KEEP_COUNT=5 ./cleanup-cloudrun.sh
+
+# Cleanup — legacy GCR sweep
+REPOSITORY=us.gcr.io/my-project ./cleanup-cloudrun.sh --sweep-repo
 ```
 
 ## `.env` for cleanup-cloudrun.sh
 
 ```bash
-# Required
+# Required for targeted mode; auto-discover only needs GOOGLE_CLOUD_PROJECT
 GOOGLE_CLOUD_PROJECT=my-project
-SERVICE_NAME=my-service
-REPO_NAME=my-repo
+SERVICE_NAME=my-service   # omit to auto-discover all services
+REPO_NAME=my-repo         # required when SERVICE_NAME is set
 
 # Optional
-GOOGLE_CLOUD_REGION=us-central1   # default
+GOOGLE_CLOUD_REGION=us-central1   # default (targeted mode only)
 KEEP_COUNT=3                       # default
 ```
 

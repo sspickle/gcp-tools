@@ -98,4 +98,5 @@ KEEP_COUNT=3                       # default
 ```bash
 ln -s /Users/steve/Development/gcp-tools/gcp-cost-report.sh ~/bin/gcp-cost-report
 ln -s /Users/steve/Development/gcp-tools/cleanup-cloudrun.sh ~/bin/cleanup-cloudrun
+ln -s /Users/steve/Development/gcp-tools/gcp-bucket-summary.sh ~/bin/gcp-bucket-summary
 ```
