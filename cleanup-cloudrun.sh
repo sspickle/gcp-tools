@@ -11,20 +11,24 @@ set -euo pipefail
 #   cleanup-cloudrun --sweep-repo                      # legacy GCR
 #
 # Auto-discover mode (default when SERVICE_NAME is not set):
-#   Finds all Cloud Run services and AR repos in the project and trims each.
+#   Finds all Cloud Run services, App Engine versions, AR repos, and Secret
+#   Manager secrets in the project and trims each. App Engine versions serving
+#   traffic are never deleted.
 #   Required: GOOGLE_CLOUD_PROJECT (or pass as first argument)
-#   Optional: KEEP_COUNT (default: 3)
+#   Optional: KEEP_COUNT (default: 3), SECRET_KEEP_COUNT (default: 1)
 #
 # Targeted mode (when SERVICE_NAME is set in .env or environment):
-#   Trims a specific Cloud Run service and its AR image.
+#   Trims a specific Cloud Run service, its AR image, and known secrets.
 #   Required: GOOGLE_CLOUD_PROJECT, SERVICE_NAME, REPO_NAME
 #   Optional: KEEP_COUNT (default: 3), GOOGLE_CLOUD_REGION (default: us-central1),
-#             IMAGE_NAME (default: SERVICE_NAME)
+#             IMAGE_NAME (default: SERVICE_NAME), SECRET_KEEP_COUNT (default: 1),
+#             SECRETS (space-separated list of secret names to trim)
 #
 # --sweep-repo mode (legacy Container Registry):
-#   Sweeps every image in a GCR repo, keeping the newest KEEP_COUNT versions.
+#   Sweeps every image in a GCR repo RECURSIVELY (nested paths included, e.g.
+#   app-engine-tmp/app/default/ttl-18h), keeping the newest KEEP_COUNT versions.
 #   Required: REPOSITORY (e.g. us.gcr.io/my-project)
-#   Optional: KEEP_COUNT (default: 1)
+#   Optional: KEEP_COUNT (default: 1), GCR_MAX_DEPTH (default: 8)
 #
 # Common:
 #   DRY_RUN=1   Print what would be deleted without deleting
@@ -38,20 +42,25 @@ Usage: cleanup-cloudrun [PROJECT_ID] [--dry-run]
        cleanup-cloudrun --sweep-repo
 
 Auto-discover mode (default when SERVICE_NAME is not set):
-  Finds all Cloud Run services and AR repos in the project and trims each.
+  Finds all Cloud Run services, App Engine versions, AR repos, and Secret Manager
+  secrets and trims each. App Engine versions serving traffic are never deleted.
   Required: GOOGLE_CLOUD_PROJECT (or pass as first argument)
-  Optional: KEEP_COUNT (default: 3), DRY_RUN=1
+  Optional: KEEP_COUNT (default: 3), SECRET_KEEP_COUNT (default: 1), DRY_RUN=1
 
 Targeted mode (when SERVICE_NAME is set in .env or environment):
-  Trims a specific Cloud Run service and its AR image.
+  Trims a specific Cloud Run service, its AR image, and named secrets.
   Required: GOOGLE_CLOUD_PROJECT, SERVICE_NAME, REPO_NAME
   Optional: KEEP_COUNT (default: 3), GOOGLE_CLOUD_REGION (default: us-central1),
-            IMAGE_NAME (default: SERVICE_NAME)
+            IMAGE_NAME (default: SERVICE_NAME), SECRET_KEEP_COUNT (default: 1),
+            SECRETS (space-separated list of secret names to trim)
 
 --sweep-repo mode (legacy Container Registry):
-  Sweeps every image in a GCR repository, keeping the newest KEEP_COUNT versions.
+  Sweeps every image in a GCR repository RECURSIVELY, keeping the newest
+  KEEP_COUNT versions. Nested paths count: App Engine hides its build scratch
+  several levels down (app-engine-tmp/app/default/ttl-18h) and that is usually
+  the bulk of the repo.
   Required: REPOSITORY (e.g. us.gcr.io/my-project)
-  Optional: KEEP_COUNT (default: 1)
+  Optional: KEEP_COUNT (default: 1), GCR_MAX_DEPTH (default: 8)
 
 Common:
   DRY_RUN=1   Print what would be deleted without deleting
@@ -70,6 +79,9 @@ fi
 PROJECT_ARG=""
 DRY_RUN="${DRY_RUN:-0}"
 SWEEP_REPO=0
+# Recursion limit for the legacy GCR tree. Real nesting tops out around 4
+# (app-engine-tmp/app/default/ttl-18h); this is a runaway guard, not a tuning knob.
+GCR_MAX_DEPTH="${GCR_MAX_DEPTH:-8}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -88,6 +100,80 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ---------------------------------------------------------------------------
+# Helper: keep the newest `keep` manifests of ONE legacy GCR image path.
+# Silent when the path holds no manifests of its own: in GCR a path is both a
+# possible image and a parent of other images, and most parents are empty.
+# ---------------------------------------------------------------------------
+trim_gcr_image() {
+  local image_url="$1" keep="$2"
+
+  local digests
+  digests=$(gcloud container images list-tags "${image_url}" \
+    --sort-by="~timestamp" \
+    --format="value(digest)" 2>/dev/null || true)
+
+  [[ -z "${digests}" ]] && return 0
+
+  echo "  ${image_url}"
+  local count=0
+  while IFS= read -r digest; do
+    [[ -z "${digest}" ]] && continue
+    count=$((count + 1))
+    [[ "${digest}" != sha256:* ]] && digest="sha256:${digest}"
+    if [[ ${count} -le ${keep} ]]; then
+      echo "    keeping  ${digest:0:19}..."
+    else
+      echo "    deleting ${digest:0:19}..."
+      if [[ "${DRY_RUN}" != "1" ]]; then
+        gcloud container images delete "${image_url}@${digest}" \
+          --force-delete-tags \
+          --quiet 2>/dev/null || echo "      (skipped)"
+      fi
+    fi
+  done <<< "${digests}"
+}
+
+# ---------------------------------------------------------------------------
+# Helper: sweep a legacy GCR repository RECURSIVELY.
+#
+# `gcloud container images list --repository=X` returns only the immediate
+# children of X, never a full tree, and GCR nests arbitrarily deep. App Engine
+# writes its build scratch several levels down, e.g.
+#     us.gcr.io/PROJECT/app-engine-tmp/app/default/ttl-18h
+# A single-level sweep sees `app-engine-tmp`, finds no manifests directly on
+# it, prints "no versions found", and moves on -- silently missing everything
+# underneath. On an App Engine project that is most of the repository: on
+# glowscript-py38 it hid 90 of 98 manifests (~10GB, the fleet's largest single
+# line item) for as long as this script has existed.
+#
+# The `ttl-18h`/`ttl-7d` names are Google's own expiry hint, but nothing
+# enforces them -- they pile up one batch per `gcloud app deploy` until swept.
+# ---------------------------------------------------------------------------
+sweep_gcr_repo() {
+  local repository="$1" keep="$2" depth="${3:-0}"
+
+  if [[ ${depth} -ge ${GCR_MAX_DEPTH} ]]; then
+    echo "  (max depth ${GCR_MAX_DEPTH} reached at ${repository} — not descending)"
+    return 0
+  fi
+
+  # A node can hold manifests AND children: trim here, then descend.
+  trim_gcr_image "${repository}" "${keep}"
+
+  local children
+  children=$(gcloud container images list \
+    --repository="${repository}" \
+    --format="value(name)" 2>/dev/null || true)
+
+  [[ -z "${children}" ]] && return 0
+
+  while IFS= read -r child; do
+    [[ -z "${child}" ]] && continue
+    sweep_gcr_repo "${child}" "${keep}" $((depth + 1))
+  done <<< "${children}"
+}
+
+# ---------------------------------------------------------------------------
 # --sweep-repo mode: keep newest KEEP_COUNT versions of every image in a
 # legacy Container Registry repository (uses gcloud container images, not AR)
 # ---------------------------------------------------------------------------
@@ -100,45 +186,7 @@ if [[ $SWEEP_REPO -eq 1 ]]; then
   echo "Keeping newest ${KEEP_COUNT} version(s) of each image"
   echo ""
 
-  IMAGE_NAMES=$(gcloud container images list \
-    --repository="${REPOSITORY}" \
-    --format="value(name)" 2>/dev/null || true)
-
-  if [[ -z "${IMAGE_NAMES}" ]]; then
-    echo "No images found in ${REPOSITORY}"
-    exit 0
-  fi
-
-  while IFS= read -r image_url; do
-    image_name="${image_url##*/}"
-    echo "=== ${image_name} ==="
-
-    DIGESTS=$(gcloud container images list-tags "${image_url}" \
-      --sort-by="~timestamp" \
-      --format="value(digest)" 2>/dev/null || true)
-
-    if [[ -z "${DIGESTS}" ]]; then
-      echo "  no versions found"
-      continue
-    fi
-
-    COUNT=0
-    while IFS= read -r digest; do
-      [[ -z "${digest}" ]] && continue
-      COUNT=$((COUNT + 1))
-      [[ "${digest}" != sha256:* ]] && digest="sha256:${digest}"
-      if [[ ${COUNT} -le ${KEEP_COUNT} ]]; then
-        echo "  keeping  ${digest:0:19}..."
-      else
-        echo "  deleting ${digest:0:19}..."
-        if [[ "${DRY_RUN}" != "1" ]]; then
-          gcloud container images delete "${image_url}@${digest}" \
-            --force-delete-tags \
-            --quiet 2>/dev/null || echo "    (skipped)"
-        fi
-      fi
-    done <<< "${DIGESTS}"
-  done <<< "${IMAGE_NAMES}"
+  sweep_gcr_repo "${REPOSITORY}" "${KEEP_COUNT}"
 
   echo ""
   echo "=== Done ==="
@@ -149,11 +197,93 @@ fi
 GOOGLE_CLOUD_PROJECT="${PROJECT_ARG:-${GOOGLE_CLOUD_PROJECT:-}}"
 GOOGLE_CLOUD_PROJECT="${GOOGLE_CLOUD_PROJECT:?Set GOOGLE_CLOUD_PROJECT in .env, the environment, or pass as first argument}"
 KEEP_COUNT="${KEEP_COUNT:-3}"
+SECRET_KEEP_COUNT="${SECRET_KEEP_COUNT:-1}"
+
+_ACTIVE_ACCOUNT=$(gcloud config get-value account 2>/dev/null || true)
+_ACTIVE_CONFIG=$(gcloud config configurations list --filter="is_active=true" --format="value(name)" 2>/dev/null || true)
 
 [[ "${DRY_RUN}" == "1" ]] && echo "--- DRY RUN — nothing will be deleted ---"
-echo "Project: ${GOOGLE_CLOUD_PROJECT}"
+echo "Project:  ${GOOGLE_CLOUD_PROJECT}"
+echo "Account:  ${_ACTIVE_ACCOUNT:-unknown} (config: ${_ACTIVE_CONFIG:-default})"
 echo "Keeping last ${KEEP_COUNT} revisions/images per service"
 echo ""
+
+# Confirm account+project before destructive operations.
+# Set GCLOUD_ACCOUNT_OK=1 to skip (e.g. in CI or when piping output).
+if [[ -z "${GCLOUD_ACCOUNT_OK:-}" ]]; then
+  read -r -p "Proceed with this account and project? [y/N] " _CONFIRM
+  if [[ "${_CONFIRM}" != "y" && "${_CONFIRM}" != "Y" ]]; then
+    echo "Aborted."
+    exit 1
+  fi
+  echo ""
+fi
+
+# ---------------------------------------------------------------------------
+# Helper: trim old App Engine versions, keeping the newest `keep` per service.
+#
+# App Engine retains every version ever deployed, and each one holds its own
+# code and build artifacts -- the same accumulation Cloud Run revisions have,
+# on a service this script otherwise ignores entirely. `--no-promote` deploys
+# make it worse: they add a version that will never take traffic on its own.
+#
+# A version serving ANY traffic is never deleted, regardless of age: a traffic
+# split can leave an old version live (canary/rollback), so age alone is not a
+# safe signal. Deleting a version is irreversible -- the newest `keep` are held
+# back as rollback targets.
+# ---------------------------------------------------------------------------
+trim_app_versions() {
+  local keep="$1"
+
+  # No App Engine app here? Nothing to do -- most projects have none.
+  if ! gcloud app describe --project="${GOOGLE_CLOUD_PROJECT}" >/dev/null 2>&1; then
+    echo "  no App Engine app in this project"
+    return 0
+  fi
+
+  local versions
+  versions=$(gcloud app versions list \
+    --project="${GOOGLE_CLOUD_PROJECT}" \
+    --sort-by="service,~version.createTime" \
+    --format="value(service,id,traffic_split)" 2>/dev/null || true)
+
+  if [[ -z "${versions}" ]]; then
+    echo "  no versions found"
+    return 0
+  fi
+
+  # Grouped by service via the sort above, so a prev/counter pair is enough --
+  # bash 3.2 (macOS default) has no associative arrays.
+  local prev_svc="" count=0
+  while IFS=$'\t' read -r svc id split; do
+    [[ -z "${svc}" || -z "${id}" ]] && continue
+
+    if [[ "${svc}" != "${prev_svc}" ]]; then
+      echo "  service: ${svc}"
+      prev_svc="${svc}"
+      count=0
+    fi
+    count=$((count + 1))
+
+    # traffic_split is a float ("1.00", "0.50"); awk keeps this shell-portable.
+    if awk "BEGIN{exit !(${split:-0} > 0)}"; then
+      echo "    keeping  ${id}  (serving ${split})"
+      continue
+    fi
+
+    if [[ ${count} -le ${keep} ]]; then
+      echo "    keeping  ${id}"
+    else
+      echo "    deleting ${id}"
+      if [[ "${DRY_RUN}" != "1" ]]; then
+        gcloud app versions delete "${id}" \
+          --service="${svc}" \
+          --project="${GOOGLE_CLOUD_PROJECT}" \
+          --quiet 2>/dev/null || echo "      (skipped)"
+      fi
+    fi
+  done <<< "${versions}"
+}
 
 # ---------------------------------------------------------------------------
 # Helper: trim old revisions for one Cloud Run service
@@ -231,52 +361,45 @@ trim_ar_image() {
 }
 
 # ---------------------------------------------------------------------------
-# Helper: sweep old versions of every image in a GCR repository
+# Helper: destroy old active versions of a Secret Manager secret, keeping
+# the newest KEEP (default 1). Storage bills per ACTIVE version-replica, where
+# active = ENABLED *or* DISABLED — only DESTROYED versions stop billing (and
+# the 6-version free tier counts enabled+disabled alike). So we must destroy,
+# not merely disable, to actually reclaim storage cost.
 # ---------------------------------------------------------------------------
-sweep_gcr_repo() {
-  local repository="$1"
+trim_secret_versions() {
+  local secret="$1" keep="${2:-1}"
+  echo "  secret: ${secret}"
 
-  local image_names
-  image_names=$(gcloud container images list \
-    --repository="${repository}" \
+  # All active (enabled or disabled) versions, newest first. Both states bill.
+  local versions
+  versions=$(gcloud secrets versions list "${secret}" \
+    --project="${GOOGLE_CLOUD_PROJECT}" \
+    --filter="state=ENABLED OR state=DISABLED" \
+    --sort-by="~createTime" \
     --format="value(name)" 2>/dev/null || true)
 
-  if [[ -z "${image_names}" ]]; then
-    echo "  (no images)"
+  if [[ -z "${versions}" ]]; then
+    echo "    no active versions found"
     return
   fi
 
-  while IFS= read -r image_url; do
-    local image_name="${image_url##*/}"
-    echo "  ${image_name}"
-
-    local digests
-    digests=$(gcloud container images list-tags "${image_url}" \
-      --sort-by="~timestamp" \
-      --format="value(digest)" 2>/dev/null || true)
-
-    if [[ -z "${digests}" ]]; then
-      echo "    no versions found"
-      continue
-    fi
-
-    local count=0
-    while IFS= read -r digest; do
-      [[ -z "${digest}" ]] && continue
-      count=$((count + 1))
-      [[ "${digest}" != sha256:* ]] && digest="sha256:${digest}"
-      if [[ ${count} -le ${KEEP_COUNT} ]]; then
-        echo "    keeping  ${digest:0:19}..."
-      else
-        echo "    deleting ${digest:0:19}..."
-        if [[ "${DRY_RUN}" != "1" ]]; then
-          gcloud container images delete "${image_url}@${digest}" \
-            --force-delete-tags \
-            --quiet 2>/dev/null || echo "      (skipped)"
-        fi
+  local count=0
+  while IFS= read -r ver; do
+    [[ -z "${ver}" ]] && continue
+    count=$((count + 1))
+    if [[ ${count} -le ${keep} ]]; then
+      echo "    keeping  ${ver}"
+    else
+      echo "    destroying ${ver}"
+      if [[ "${DRY_RUN}" != "1" ]]; then
+        gcloud secrets versions destroy "${ver}" \
+          --secret="${secret}" \
+          --project="${GOOGLE_CLOUD_PROJECT}" \
+          --quiet 2>/dev/null || echo "      (skipped)"
       fi
-    done <<< "${digests}"
-  done <<< "${image_names}"
+    fi
+  done <<< "${versions}"
 }
 
 # ---------------------------------------------------------------------------
@@ -293,6 +416,15 @@ if [[ -n "${SERVICE_NAME:-}" ]]; then
   trim_revisions "${SERVICE_NAME}" "${GOOGLE_CLOUD_REGION}"
   echo ""
   trim_ar_image "${IMAGE_PATH}" "${REPO_NAME}/${IMAGE_NAME}"
+
+  if [[ -n "${SECRETS:-}" ]]; then
+    echo ""
+    echo "=== Secret Manager ==="
+    for secret_name in ${SECRETS}; do
+      trim_secret_versions "${secret_name}" "${SECRET_KEEP_COUNT}"
+    done
+  fi
+
   echo ""
   echo "=== Done ==="
   exit 0
@@ -320,6 +452,12 @@ else
     trim_revisions "${svc}" "${svc_region}"
   done <<< "${SERVICES}"
 fi
+
+echo ""
+
+# --- App Engine ---
+echo "=== App Engine ==="
+trim_app_versions "${KEEP_COUNT}"
 
 echo ""
 
@@ -352,8 +490,14 @@ else
 
     images=$(gcloud artifacts docker images list "${image_base}" \
       --project="${GOOGLE_CLOUD_PROJECT}" \
-      --format="value(image)" \
-      2>/dev/null | grep -v "^Listing" | sort -u || true)
+      --format="json" \
+      2>/dev/null | python3 -c "
+import json, sys
+imgs = json.load(sys.stdin)
+names = set(i['package'] for i in imgs if i.get('package'))
+for n in sorted(names):
+    print(n)
+" 2>/dev/null || true)
 
     if [[ -z "${images}" ]]; then
       echo "  ${repo_id}: no images"
@@ -392,8 +536,26 @@ else
   while IFS= read -r gcr_repo; do
     [[ -z "${gcr_repo}" ]] && continue
     echo "${gcr_repo%%/*}:"
-    sweep_gcr_repo "${gcr_repo}"
+    sweep_gcr_repo "${gcr_repo}" "${KEEP_COUNT}"
   done <<< "${GCR_REPOS}"
+fi
+
+echo ""
+
+# --- Secret Manager ---
+echo "=== Secret Manager ==="
+
+ALL_SECRETS=$(gcloud secrets list \
+  --project="${GOOGLE_CLOUD_PROJECT}" \
+  --format="value(name)" 2>/dev/null || true)
+
+if [[ -z "${ALL_SECRETS}" ]]; then
+  echo "  no secrets found"
+else
+  while IFS= read -r secret_name; do
+    [[ -z "${secret_name}" ]] && continue
+    trim_secret_versions "${secret_name}" "${SECRET_KEEP_COUNT}"
+  done <<< "${ALL_SECRETS}"
 fi
 
 echo ""

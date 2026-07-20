@@ -113,6 +113,7 @@ echo -e " ${GREEN}${TYPE_LABEL}${NC}"
 # Running totals (bytes = integers; costs = floats via python)
 FB_BYTES=0;        FB_COST="0.00000"
 AR_BYTES=0;        AR_COST="0.00000"
+GCR_BYTES=0;       GCR_COST="0.00000"
 GCS_BYTES=0;       GCS_COST="0.00000"
 DS_BYTES=0;        DS_COST="0.00000"
 GCE_DISK_BYTES=0;  GCE_DISK_COST="0.00000"
@@ -183,26 +184,68 @@ for r in json.load(sys.stdin):
     while IFS=$'\t' read -r repo_name fmt location is_gcr; do
       if [[ "$fmt" == "DOCKER" ]]; then
         if [[ "$is_gcr" == "1" ]]; then
-          printf "    %-42s  legacy Container Registry — sizes stored in GCS (not available via AR API)\n" \
-            "${repo_name} (${location})"
+          # GCR blobs live in gs://<prefix>.artifacts.PROJECT.appspot.com
+          if [[ "$repo_name" == "gcr.io" ]]; then
+            GCR_BUCKET="artifacts.${PROJECT}.appspot.com"
+          else
+            GCR_BUCKET="${repo_name%.gcr.io}.artifacts.${PROJECT}.appspot.com"
+          fi
+          GCR_BUCKET_BYTES=$(python3 -c "
+import json, urllib.request, urllib.parse
+token='${TOKEN}'; project='${PROJECT}'
+bucket='${GCR_BUCKET}'
+total=0; page_token=''
+while True:
+    params={'fields':'nextPageToken,items(size)','maxResults':'1000'}
+    if page_token: params['pageToken']=page_token
+    url='https://storage.googleapis.com/storage/v1/b/'+bucket+'/o?'+urllib.parse.urlencode(params)
+    req=urllib.request.Request(url,headers={'Authorization':'Bearer '+token,'x-goog-user-project':project})
+    try:
+        with urllib.request.urlopen(req,timeout=15) as r: d=json.loads(r.read())
+    except Exception: break
+    for item in d.get('items',[]): total+=int(item.get('size',0))
+    page_token=d.get('nextPageToken','')
+    if not page_token: break
+print(total)
+" 2>/dev/null || echo "0")
+          GCR_BUCKET_BYTES=${GCR_BUCKET_BYTES:-0}
+          if [[ "$GCR_BUCKET_BYTES" -gt 0 ]]; then
+            HUMAN=$(bytes_human "$GCR_BUCKET_BYTES")
+            ITEM_COST=$(cost "$GCR_BUCKET_BYTES" "0.026")
+            printf "    %-42s  GCS: %10s  ~\$%s/mo\n" \
+              "${repo_name} (${location})" "$HUMAN" "$ITEM_COST"
+            GCR_BYTES=$((GCR_BYTES + GCR_BUCKET_BYTES))
+            GCR_COST=$(addcost "$GCR_COST" "$ITEM_COST")
+          else
+            printf "    %-42s  GCS bucket empty or not found\n" "${repo_name} (${location})"
+          fi
           continue
         fi
-        IMAGE_PATH="${location}-docker.pkg.dev/${PROJECT}/${repo_name}"
-
-        IMAGES_JSON=$(gcloud artifacts docker images list "$IMAGE_PATH" \
-          --project="${PROJECT}" \
-          --format="json" 2>/dev/null || echo '[]')
-
-        read -r COUNT BYTES < <(echo "$IMAGES_JSON" | python3 -c "
-import json,sys
-imgs=json.load(sys.stdin)
-total=sum(int(i.get('imageSizeBytes',0)) for i in imgs)
-print(len(imgs), total)
+        read -r COUNT BYTES < <(python3 -c "
+import json, urllib.request, urllib.parse, sys
+token='${TOKEN}'; project='${PROJECT}'; location='${location}'; repo='${repo_name}'
+base='https://artifactregistry.googleapis.com/v1/projects/'+project+'/locations/'+location+'/repositories/'+repo+'/dockerImages'
+total=0; count=0; page_token=''
+while True:
+    params={'pageSize':'100'}
+    if page_token: params['pageToken']=page_token
+    url=base+'?'+urllib.parse.urlencode(params)
+    req=urllib.request.Request(url,headers={'Authorization':'Bearer '+token})
+    try:
+        with urllib.request.urlopen(req,timeout=15) as r: d=json.loads(r.read())
+    except Exception: break
+    imgs=d.get('dockerImages',[])
+    for i in imgs:
+        total+=int(i.get('imageSizeBytes',0))
+        count+=1
+    page_token=d.get('nextPageToken','')
+    if not page_token: break
+print(count, total)
 " 2>/dev/null || echo "0 0")
 
         HUMAN=$(bytes_human "$BYTES")
         ITEM_COST=$(cost "$BYTES" "0.10")
-        printf "    %-42s  %3d images    %10s  ~\$%s/mo\n" \
+        printf "    %-42s  %3d images    %10s  ~\$%s/mo*\n" \
           "${repo_name} (${location})" "$COUNT" "$HUMAN" "$ITEM_COST"
 
         AR_BYTES=$((AR_BYTES + BYTES))
@@ -211,6 +254,7 @@ print(len(imgs), total)
         printf "    %-42s  %-6s repo (size N/A)\n" "${repo_name} (${location})" "$fmt"
       fi
     done <<< "$REPO_LIST"
+    note "* AR sizes are per-image manifest totals; shared layers deduplicated in actual billing"
   fi
 else
   sec "Artifact Registry"
@@ -429,6 +473,9 @@ for d in json.load(sys.stdin):
   IP_LIST=$(echo "$CE_IPS" | python3 -c "
 import json,sys
 for a in json.load(sys.stdin):
+    # Only external IPs incur charges; skip internal/private addresses
+    if a.get('addressType','EXTERNAL') == 'INTERNAL':
+        continue
     name=a['name']
     region=a.get('region','global').split('/')[-1] if 'region' in a else 'global'
     addr=a.get('address','?')
@@ -504,14 +551,16 @@ hdr "Summary: ${PROJECT}"
 
 GCE_TOTAL_COST=$(addcost "$GCE_DISK_COST" "$GCE_IP_COST")
 
-TOTAL_BYTES=$((FB_BYTES + AR_BYTES + GCS_BYTES + DS_BYTES + GCE_DISK_BYTES))
+TOTAL_BYTES=$((FB_BYTES + AR_BYTES + GCR_BYTES + GCS_BYTES + DS_BYTES + GCE_DISK_BYTES))
 TOTAL_COST=$(addcost "$FB_COST" "$AR_COST")
+TOTAL_COST=$(addcost "$TOTAL_COST" "$GCR_COST")
 TOTAL_COST=$(addcost "$TOTAL_COST" "$GCS_COST")
 TOTAL_COST=$(addcost "$TOTAL_COST" "$DS_COST")
 TOTAL_COST=$(addcost "$TOTAL_COST" "$GCE_TOTAL_COST")
 
 FB_HUMAN=$(bytes_human "$FB_BYTES")
 AR_HUMAN=$(bytes_human "$AR_BYTES")
+GCR_HUMAN=$(bytes_human "$GCR_BYTES")
 GCS_HUMAN=$(bytes_human "$GCS_BYTES")
 DS_HUMAN=$(bytes_human "$DS_BYTES")
 GCE_HUMAN=$(bytes_human "$GCE_DISK_BYTES")
@@ -519,6 +568,7 @@ TOTAL_HUMAN=$(bytes_human "$TOTAL_BYTES")
 
 printf "  %-26s  %10s  ~\$%s/mo\n" "Firebase Hosting:"    "$FB_HUMAN"    "$FB_COST"
 printf "  %-26s  %10s  ~\$%s/mo\n" "Artifact Registry:"   "$AR_HUMAN"    "$AR_COST"
+printf "  %-26s  %10s  ~\$%s/mo\n" "Legacy GCR (GCS):"    "$GCR_HUMAN"   "$GCR_COST"
 printf "  %-26s  %10s  ~\$%s/mo\n" "App Engine (GCS):"    "$GCS_HUMAN"   "$GCS_COST"
 printf "  %-26s  %10s  ~\$%s/mo\n" "Cloud Datastore:"     "$DS_HUMAN"    "$DS_COST"
 printf "  %-26s  %10s  ~\$%s/mo\n" "Compute Engine:"      "$GCE_HUMAN"   "$GCE_TOTAL_COST"
@@ -526,6 +576,7 @@ echo   "  ───────────────────────�
 printf "  %-26s  %10s  ~\$%s/mo\n" "Total:"               "$TOTAL_HUMAN" "$TOTAL_COST"
 echo
 note "CE includes all persistent disk storage + unused reserved IPs; instance compute not estimated"
+note "Legacy GCR billed at GCS Standard rate (\$0.026/GB); includes orphaned blobs pending GC"
 note "Rates: Firebase \$0.026/GB, AR \$0.10/GB, GCS \$0.020/GB, Datastore \$0.108/GB, CE disk \$0.04–\$0.17/GB"
 note "Excludes free tiers and egress; Datastore figures updated ~daily"
 echo
