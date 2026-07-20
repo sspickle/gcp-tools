@@ -2,8 +2,9 @@
 set -euo pipefail
 
 # =============================================================================
-# Clean up old Cloud Run revisions and Artifact Registry images,
-# keeping the most recent KEEP_COUNT of each.
+# Clean up old Cloud Run revisions and Artifact Registry images (keeping the
+# most recent KEEP_COUNT of each), and set an auto-expiry lifecycle rule on
+# build-scratch storage buckets.
 #
 # Usage:
 #   cleanup-cloudrun [PROJECT_ID] [--dry-run]          # auto-discover all
@@ -15,7 +16,8 @@ set -euo pipefail
 #   Manager secrets in the project and trims each. App Engine versions serving
 #   traffic are never deleted.
 #   Required: GOOGLE_CLOUD_PROJECT (or pass as first argument)
-#   Optional: KEEP_COUNT (default: 3), SECRET_KEEP_COUNT (default: 1)
+#   Optional: KEEP_COUNT (default: 3), SECRET_KEEP_COUNT (default: 1),
+#             BUCKET_AGE_DAYS (default: 30)
 #
 # Targeted mode (when SERVICE_NAME is set in .env or environment):
 #   Trims a specific Cloud Run service, its AR image, and known secrets.
@@ -42,10 +44,12 @@ Usage: cleanup-cloudrun [PROJECT_ID] [--dry-run]
        cleanup-cloudrun --sweep-repo
 
 Auto-discover mode (default when SERVICE_NAME is not set):
-  Finds all Cloud Run services, App Engine versions, AR repos, and Secret Manager
-  secrets and trims each. App Engine versions serving traffic are never deleted.
+  Finds all Cloud Run services, App Engine versions, AR repos, Secret Manager
+  secrets, and build-scratch buckets and trims each. App Engine versions serving
+  traffic are never deleted; build buckets get a delete-after-N-days rule.
   Required: GOOGLE_CLOUD_PROJECT (or pass as first argument)
-  Optional: KEEP_COUNT (default: 3), SECRET_KEEP_COUNT (default: 1), DRY_RUN=1
+  Optional: KEEP_COUNT (default: 3), SECRET_KEEP_COUNT (default: 1),
+            BUCKET_AGE_DAYS (default: 30), DRY_RUN=1
 
 Targeted mode (when SERVICE_NAME is set in .env or environment):
   Trims a specific Cloud Run service, its AR image, and named secrets.
@@ -403,6 +407,75 @@ trim_secret_versions() {
 }
 
 # ---------------------------------------------------------------------------
+# Helper: give build-scratch buckets an auto-expiry lifecycle rule.
+#
+# Cloud Build drops a source tarball in gs://<project>_cloudbuild on EVERY build,
+# and App Engine stages each deploy in gs://staging.<project>.appspot.com; both
+# accumulate one object per deploy forever with no default expiry (this is the
+# Cloud Storage line item that grows quietly). Unlike images/revisions we don't
+# delete anything here -- we set a delete-after-N-days lifecycle rule so GCS
+# expires old objects itself. Idempotent: a bucket that already has ANY rule is
+# left alone.
+#
+# We match ONLY build-scratch buckets and deliberately skip everything else:
+#   - *.artifacts.*.appspot.com / *.gcr.io -> container image layers (handled by
+#     the AR / GCR sweeps; a delete rule here would drop image data)
+#   - app-data buckets (trinket-materials, -snapshots, -user-assets, etc.) ->
+#     NEVER touched; expiring user data would be catastrophic
+# ---------------------------------------------------------------------------
+trim_build_buckets() {
+  local age="${BUCKET_AGE_DAYS:-30}"
+
+  local buckets
+  buckets=$(gcloud storage buckets list \
+    --project="${GOOGLE_CLOUD_PROJECT}" \
+    --format="value(name)" 2>/dev/null || true)
+
+  if [[ -z "${buckets}" ]]; then
+    echo "  no buckets found"
+    return 0
+  fi
+
+  local found=0
+  while IFS= read -r bucket; do
+    [[ -z "${bucket}" ]] && continue
+    # Allowlist build-scratch names only. `staging.*.appspot.com` is App Engine
+    # deploy scratch; `*_cloudbuild` is Cloud Build source. Anything else -- app
+    # data, image-backing artifacts buckets -- is skipped.
+    case "${bucket}" in
+      *_cloudbuild|staging.*.appspot.com|gcf-sources-*) ;;
+      *) continue ;;
+    esac
+    found=1
+
+    # Already has a lifecycle rule? Leave it be (idempotent across runs).
+    local existing
+    existing=$(gcloud storage buckets describe "gs://${bucket}" \
+      --project="${GOOGLE_CLOUD_PROJECT}" \
+      --format="value(lifecycle_config.rule)" 2>/dev/null || true)
+    if [[ -n "${existing}" ]]; then
+      echo "  keeping   gs://${bucket}  (lifecycle rule already set)"
+      continue
+    fi
+
+    echo "  setting   gs://${bucket}  (delete objects older than ${age}d)"
+    if [[ "${DRY_RUN}" != "1" ]]; then
+      local lc
+      lc="$(mktemp)"
+      printf '{"rule":[{"action":{"type":"Delete"},"condition":{"age":%d}}]}' "${age}" > "${lc}"
+      gcloud storage buckets update "gs://${bucket}" \
+        --lifecycle-file="${lc}" \
+        --project="${GOOGLE_CLOUD_PROJECT}" \
+        --quiet 2>/dev/null || echo "      (skipped)"
+      rm -f "${lc}"
+    fi
+  done <<< "${buckets}"
+
+  [[ ${found} -eq 0 ]] && echo "  no build-scratch buckets found"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Targeted mode: SERVICE_NAME set in .env or environment
 # ---------------------------------------------------------------------------
 if [[ -n "${SERVICE_NAME:-}" ]]; then
@@ -424,6 +497,10 @@ if [[ -n "${SERVICE_NAME:-}" ]]; then
       trim_secret_versions "${secret_name}" "${SECRET_KEEP_COUNT}"
     done
   fi
+
+  echo ""
+  echo "=== Cloud Storage ==="
+  trim_build_buckets
 
   echo ""
   echo "=== Done ==="
@@ -557,6 +634,12 @@ else
     trim_secret_versions "${secret_name}" "${SECRET_KEEP_COUNT}"
   done <<< "${ALL_SECRETS}"
 fi
+
+echo ""
+
+# --- Cloud Storage (build-scratch bucket lifecycle) ---
+echo "=== Cloud Storage ==="
+trim_build_buckets
 
 echo ""
 echo "=== Done ==="
