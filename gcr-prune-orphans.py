@@ -262,18 +262,18 @@ def main():
         f'gs://{bucket}/containers/images/{d}' for d in sorted(orphaned)
     ]
     proc = subprocess.run(
-        ['gsutil', '-m', 'rm', '-I'],
+        ['gcloud', 'storage', 'rm', '-I'],
         input='\n'.join(to_delete),
         text=True, capture_output=True,
     )
-    # gsutil -m rm prints progress to stderr
+    # gcloud storage rm prints progress to stderr
     for line in proc.stderr.splitlines()[-5:]:
         print(f'  {line}')
 
     if proc.returncode == 0:
         print(f'\n  {GREEN}✓ Deleted {len(orphaned)} blobs.{NC}')
     else:
-        print(f'\n  {YELLOW}⚠ gsutil exited {proc.returncode} '
+        print(f'\n  {YELLOW}⚠ gcloud storage exited {proc.returncode} '
               f'(some objects may already be gone).{NC}')
     note("Re-run without --delete to verify the bucket is clean.")
 
