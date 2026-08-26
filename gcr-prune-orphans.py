@@ -429,14 +429,15 @@ def main():
     to_delete = [
         f'gs://{bucket}/containers/images/{d}' for d in sorted(orphaned)
     ]
+    # --quiet: gcloud storage rm otherwise asks "continue? (Y/n)" — and with -I
+    # (paths supplied on stdin) that prompt has no stdin to read from, so the
+    # command hangs invisibly. Output is left to STREAM (not captured) so the
+    # operator sees live progress instead of a silent wait.
     proc = subprocess.run(
-        ['gcloud', 'storage', 'rm', '-I'],
+        ['gcloud', 'storage', 'rm', '-I', '--quiet'],
         input='\n'.join(to_delete),
-        text=True, capture_output=True,
+        text=True,
     )
-    # gcloud storage rm prints progress to stderr
-    for line in proc.stderr.splitlines()[-5:]:
-        print(f'  {line}')
 
     if proc.returncode == 0:
         print(f'\n  {GREEN}✓ Deleted {len(orphaned)} blobs.{NC}')
