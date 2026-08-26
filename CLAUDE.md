@@ -4,13 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Two standalone bash scripts for GCP cost visibility and cleanup. No build system, no tests, no dependencies beyond `gcloud`, `python3`, and `curl`.
+Standalone CLI tools for GCP cost visibility and cleanup: bash scripts (`gcp-cost-report.sh`, `cleanup-cloudrun.sh`, `gcp-bucket-summary.sh`) plus one uv single-file Python script (`gcr-prune-orphans.py`). No build system, no tests. Dependencies: `gcloud`, `python3`, `curl`, and `uv` (for the pruner; it also runs under plain `python3`).
 
 ## Scripts
 
 **`gcp-cost-report.sh`** — takes a single GCP project ID, detects enabled APIs (`firebasehosting`, `artifactregistry`, `run`, `appengine`, `datastore`, `compute`), and reports storage usage with estimated costs. Accepts `--billing-csv <file>` to show a ground-truth billing summary from a GCP billing report CSV alongside the per-resource analysis. Uses `python3` inline for float math (avoids `bc`/`awk` portability issues).
 
 **`cleanup-cloudrun.sh`** — deletes old Cloud Run revisions and Artifact Registry Docker images, keeping the newest `KEEP_COUNT`. Three modes: auto-discover (default, no `SERVICE_NAME`), targeted (`SERVICE_NAME` set), and `--sweep-repo` (legacy GCR). Reads config from `.env` in the script's directory or environment variables.
+
+**`gcr-prune-orphans.py`** — reclaims the layer blobs that `cleanup-cloudrun`'s manifest deletion leaves orphaned in the legacy `us.artifacts.<project>.appspot.com` GCS bucket (GCR doesn't GC them reliably). A [PEP 723](https://peps.python.org/pep-0723/) uv single-file script: `#!/usr/bin/env -S uv run --script`, stdlib-only (no dependencies), so `./gcr-prune-orphans.py` runs under uv with a pinned interpreter — plain `python3` also works. Dry run by default; `--delete` to act; `--dry-run` forces dry run and wins over `--delete`. Builds the keep-set from the whole `us.gcr.io/<project>` manifest tree (via GCR's `/v2/<repo>/tags/list`, which returns full digests — `gcloud list-tags --format=value(digest)` truncates) plus Cloud Run revisions, and refuses to `--delete` on an incomplete keep-set or a failed per-image integrity check. Bucket blobs of images migrated to the Artifact Registry backend are correctly excluded (they live in AR, not this bucket).
 
 ## Running
 
@@ -30,6 +32,10 @@ KEEP_COUNT=5 ./cleanup-cloudrun.sh my-project
 
 # Cleanup — legacy GCR sweep
 REPOSITORY=us.gcr.io/my-project ./cleanup-cloudrun.sh --sweep-repo
+
+# Orphaned-blob prune (dry run by default; --delete to act)
+uv run gcr-prune-orphans.py my-project
+./gcr-prune-orphans.py my-project --delete
 ```
 
 ## `.env` for cleanup-cloudrun.sh

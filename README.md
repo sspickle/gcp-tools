@@ -85,12 +85,45 @@ KEEP_COUNT=3                       # default
 
 ---
 
+### `gcr-prune-orphans.py` — reclaim orphaned GCR layer blobs
+
+```bash
+uv run gcr-prune-orphans.py <project-id>            # dry run (the default)
+./gcr-prune-orphans.py <project-id>                 # same — the shebang runs it under uv
+uv run gcr-prune-orphans.py <project-id> --delete   # actually delete
+```
+
+Deleting a GCR image removes its manifest and tags but leaves the layer blobs
+in the legacy `us.artifacts.<project>.appspot.com` bucket, and GCR's own garbage
+collection is unreliable — so `cleanup-cloudrun` trims images without the storage
+dropping. This finds bucket blobs that no surviving manifest references and (with
+`--delete`) removes them.
+
+The keep-set is built from **every** manifest still in the `us.gcr.io/<project>`
+tree (recursively) plus active Cloud Run revision images, so it never deletes a
+blob a live image needs. Safety: it **refuses to delete** on an incomplete
+keep-set (a failed registry enumeration or manifest read) or a failed integrity
+check — every image resident in the bucket must still have all its layers — and
+requires you to type the project id before a total wipe. Dry run is the default;
+`--dry-run` forces it and wins if combined with `--delete`.
+
+Post GCR→Artifact-Registry migration a project's live images keep their blobs in
+AR rather than this legacy bucket; those are correctly excluded, so what remains
+to prune is genuinely orphaned build scratch.
+
+A single-file [PEP 723](https://peps.python.org/pep-0723/) uv script —
+stdlib-only, no dependencies. Runs under `uv` (pinned interpreter) or plain
+`python3 gcr-prune-orphans.py …`.
+
+---
+
 ## Setup
 
 ### Prerequisites
 
 - `gcloud` CLI, authenticated (`gcloud auth login`)
-- `python3`
+- `python3` (used inline by the bash scripts)
+- `uv` (runs `gcr-prune-orphans.py`; plain `python3 gcr-prune-orphans.py` also works)
 - `curl`
 
 ### Install to PATH
@@ -99,4 +132,5 @@ KEEP_COUNT=3                       # default
 ln -s /Users/steve/Development/gcp-tools/gcp-cost-report.sh ~/bin/gcp-cost-report
 ln -s /Users/steve/Development/gcp-tools/cleanup-cloudrun.sh ~/bin/cleanup-cloudrun
 ln -s /Users/steve/Development/gcp-tools/gcp-bucket-summary.sh ~/bin/gcp-bucket-summary
+ln -s /Users/steve/Development/gcp-tools/gcr-prune-orphans.py ~/bin/gcr-prune-orphans
 ```
