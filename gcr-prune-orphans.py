@@ -1,5 +1,9 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
 # -*- coding: utf-8 -*-
+# /// script
+# requires-python = ">=3.8"
+# dependencies = []
+# ///
 """
 gcr-prune-orphans.py
 
