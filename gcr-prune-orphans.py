@@ -62,7 +62,7 @@ def human(b):
 def get_token():
     result = subprocess.run(
         ['gcloud', 'auth', 'print-access-token'],
-        capture_output=True, text=True
+        capture_output=True, text=True, stdin=subprocess.DEVNULL
     )
     if result.returncode != 0:
         print('ERROR: Not authenticated. Run: gcloud auth application-default login',
@@ -72,9 +72,12 @@ def get_token():
 
 
 def gcloud_json(args):
+    # stdin=DEVNULL so a disabled-API "enable and retry? (y/N)" prompt (which
+    # gcloud writes to the captured stderr, invisibly) gets EOF and defaults to
+    # No instead of blocking the whole tool on a hidden prompt.
     result = subprocess.run(
         ['gcloud'] + args + ['--format=json'],
-        capture_output=True, text=True
+        capture_output=True, text=True, stdin=subprocess.DEVNULL
     )
     if result.returncode != 0:
         return []
