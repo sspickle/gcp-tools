@@ -103,6 +103,76 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
+# Final banner. A run that could not read part of the project is not a clean
+# run: say so, and exit non-zero so a caller can tell.
+finish() {
+  if [[ -s "${_DEGRADED_FLAG}" ]]; then
+    echo "=== Done (DEGRADED -- some gcloud calls failed; see !! above) ==="
+    exit 2
+  fi
+  echo "=== Done ==="
+}
+
+# ---------------------------------------------------------------------------
+# gcloud plumbing.
+#
+# Every read below used to end in `2>/dev/null || true`, which collapses any
+# failure -- expired token, wrong account, disabled API, missing permission --
+# into an empty string. Empty then reads as "the resource does not exist", so
+# the script reports "no services found" for a project full of services.
+#
+# That is the worst failure mode a cleanup tool can have: it is indistinguish-
+# able from a clean project, and it hides precisely the misconfiguration you
+# need to see. Worse, it is silently self-consistent -- every section agrees
+# the project is empty, so nothing looks wrong.
+#
+# So: capture stderr, keep the exit status, and let callers tell "failed" and
+# "empty" apart. A failed read is reported and marks the run degraded; it never
+# masquerades as an empty result.
+# ---------------------------------------------------------------------------
+# The flag lives in a file, not a variable: gcloud_query is almost always
+# called as $(gcloud_query ...), which runs it in a subshell, and a variable
+# set there dies with the subshell. A file outlives it.
+_DEGRADED_FLAG="$(mktemp)"
+trap 'rm -f "${_DEGRADED_FLAG}"' EXIT
+
+_mark_degraded() { echo 1 >> "${_DEGRADED_FLAG}"; }
+
+# Read-only gcloud query. Echoes stdout on success. On failure, explains itself
+# on stderr, flags the run, and returns non-zero -- distinct from "returned
+# nothing", which is a legitimate answer this must never fake.
+gcloud_query() {
+  local label="$1"; shift
+  local err out rc=0
+  err="$(mktemp)"
+  out="$(gcloud "$@" 2>"${err}")" || rc=$?
+  if [[ ${rc} -ne 0 ]]; then
+    _mark_degraded
+    echo "  !! ${label}: gcloud exited ${rc} -- this section is NOT a clean result" >&2
+    head -5 "${err}" | sed 's/^/     /' >&2
+    rm -f "${err}"
+    return 1
+  fi
+  rm -f "${err}"
+  printf '%s' "${out}"
+}
+
+# Mutating gcloud command. Reports the actual reason on failure instead of a
+# bare "(skipped)", which told you something did not happen but never why.
+gcloud_mutate() {
+  local indent="$1"; shift
+  local err rc=0
+  err="$(mktemp)"
+  gcloud "$@" >/dev/null 2>"${err}" || rc=$?
+  if [[ ${rc} -ne 0 ]]; then
+    _mark_degraded
+    echo "${indent}(FAILED) $(head -2 "${err}" | tr '\n' ' ' | tr -s ' ')"
+    rm -f "${err}"
+    return 1
+  fi
+  rm -f "${err}"
+}
+
 # ---------------------------------------------------------------------------
 # Helper: keep the newest `keep` manifests of ONE legacy GCR image path.
 # Silent when the path holds no manifests of its own: in GCR a path is both a
@@ -112,9 +182,9 @@ trim_gcr_image() {
   local image_url="$1" keep="$2"
 
   local digests
-  digests=$(gcloud container images list-tags "${image_url}" \
+  digests=$(gcloud_query "list-tags ${image_url}" container images list-tags "${image_url}" \
     --sort-by="~timestamp" \
-    --format="value(digest)" 2>/dev/null || true)
+    --format="value(digest)") || return 0
 
   [[ -z "${digests}" ]] && return 0
 
@@ -129,9 +199,9 @@ trim_gcr_image() {
     else
       echo "    deleting ${digest:0:19}..."
       if [[ "${DRY_RUN}" != "1" ]]; then
-        gcloud container images delete "${image_url}@${digest}" \
+        gcloud_mutate "      " container images delete "${image_url}@${digest}" \
           --force-delete-tags \
-          --quiet 2>/dev/null || echo "      (skipped)"
+          --quiet || true
       fi
     fi
   done <<< "${digests}"
@@ -165,9 +235,9 @@ sweep_gcr_repo() {
   trim_gcr_image "${repository}" "${keep}"
 
   local children
-  children=$(gcloud container images list \
+  children=$(gcloud_query "list children of ${repository}" container images list \
     --repository="${repository}" \
-    --format="value(name)" 2>/dev/null || true)
+    --format="value(name)") || return 0
 
   [[ -z "${children}" ]] && return 0
 
@@ -193,7 +263,7 @@ if [[ $SWEEP_REPO -eq 1 ]]; then
   sweep_gcr_repo "${REPOSITORY}" "${KEEP_COUNT}"
 
   echo ""
-  echo "=== Done ==="
+  finish
   exit 0
 fi
 
@@ -211,6 +281,19 @@ echo "Project:  ${GOOGLE_CLOUD_PROJECT}"
 echo "Account:  ${_ACTIVE_ACCOUNT:-unknown} (config: ${_ACTIVE_CONFIG:-default})"
 echo "Keeping last ${KEEP_COUNT} revisions/images per service"
 echo ""
+
+# Verify this identity can actually read this project, before anything else.
+# Without this the run continues under a stale or wrong account and reports
+# every section as empty -- the failure gcloud_query exists to prevent, caught
+# once here instead of section by section.
+if ! gcloud_query "project access" projects describe "${GOOGLE_CLOUD_PROJECT}" \
+     --format="value(projectId)" >/dev/null; then
+  echo "" >&2
+  echo "Cannot read project ${GOOGLE_CLOUD_PROJECT} as ${_ACTIVE_ACCOUNT:-unknown}." >&2
+  echo "Check the active config (gcloud config configurations list), or" >&2
+  echo "re-authenticate: gcloud auth login ${_ACTIVE_ACCOUNT:-}" >&2
+  exit 1
+fi
 
 # Confirm account+project before destructive operations.
 # Set GCLOUD_ACCOUNT_OK=1 to skip (e.g. in CI or when piping output).
@@ -246,10 +329,13 @@ trim_app_versions() {
   fi
 
   local versions
-  versions=$(gcloud app versions list \
+  if ! versions=$(gcloud_query "App Engine versions" app versions list \
     --project="${GOOGLE_CLOUD_PROJECT}" \
     --sort-by="service,~version.createTime" \
-    --format="value(service,id,traffic_split)" 2>/dev/null || true)
+    --format="value(service,id,traffic_split)"); then
+    echo "  !! cannot list versions -- skipping App Engine (nothing deleted)"
+    return 0
+  fi
 
   if [[ -z "${versions}" ]]; then
     echo "  no versions found"
@@ -280,10 +366,10 @@ trim_app_versions() {
     else
       echo "    deleting ${id}"
       if [[ "${DRY_RUN}" != "1" ]]; then
-        gcloud app versions delete "${id}" \
+        gcloud_mutate "      " app versions delete "${id}" \
           --service="${svc}" \
           --project="${GOOGLE_CLOUD_PROJECT}" \
-          --quiet 2>/dev/null || echo "      (skipped)"
+          --quiet || true
       fi
     fi
   done <<< "${versions}"
@@ -297,12 +383,15 @@ trim_revisions() {
   echo "  revisions: ${svc} (${region})"
 
   local revisions
-  revisions=$(gcloud run revisions list \
+  if ! revisions=$(gcloud_query "revisions of ${svc}" run revisions list \
     --service="${svc}" \
     --region="${region}" \
     --project="${GOOGLE_CLOUD_PROJECT}" \
     --sort-by="~metadata.creationTimestamp" \
-    --format="value(metadata.name)" 2>/dev/null || true)
+    --format="value(metadata.name)"); then
+    echo "    !! cannot list revisions -- skipping ${svc} (nothing deleted)"
+    return
+  fi
 
   if [[ -z "${revisions}" ]]; then
     echo "    no revisions found"
@@ -317,10 +406,10 @@ trim_revisions() {
     else
       echo "    deleting ${rev}"
       if [[ "${DRY_RUN}" != "1" ]]; then
-        gcloud run revisions delete "${rev}" \
+        gcloud_mutate "      " run revisions delete "${rev}" \
           --region="${region}" \
           --project="${GOOGLE_CLOUD_PROJECT}" \
-          --quiet 2>/dev/null || echo "      (skipped — may be serving traffic)"
+          --quiet || true
       fi
     fi
   done <<< "${revisions}"
@@ -334,10 +423,14 @@ trim_ar_image() {
   echo "  images:    ${label}"
 
   local digests
-  digests=$(gcloud artifacts docker images list "${img_path}" \
+  local raw
+  if ! raw=$(gcloud_query "images in ${img_path}" artifacts docker images list "${img_path}" \
     --format="value(createTime,version)" \
-    --project="${GOOGLE_CLOUD_PROJECT}" 2>/dev/null \
-    | grep -v "^Listing" | sort -r | awk '{print $2}' || true)
+    --project="${GOOGLE_CLOUD_PROJECT}"); then
+    echo "    !! cannot list images -- skipping ${label} (nothing deleted)"
+    return
+  fi
+  digests=$(printf '%s\n' "${raw}" | grep -v "^Listing" | sort -r | awk '{print $2}')
 
   if [[ -z "${digests}" ]]; then
     echo "    no versions found"
@@ -353,12 +446,12 @@ trim_ar_image() {
     else
       echo "    deleting ${digest:0:19}..."
       if [[ "${DRY_RUN}" != "1" ]]; then
-        gcloud artifacts docker images delete \
+        gcloud_mutate "      " artifacts docker images delete \
           "${img_path}@${digest}" \
           --delete-tags \
           --async \
           --project="${GOOGLE_CLOUD_PROJECT}" \
-          --quiet 2>/dev/null || echo "      (skipped)"
+          --quiet || true
       fi
     fi
   done <<< "${digests}"
@@ -377,11 +470,14 @@ trim_secret_versions() {
 
   # All active (enabled or disabled) versions, newest first. Both states bill.
   local versions
-  versions=$(gcloud secrets versions list "${secret}" \
+  if ! versions=$(gcloud_query "versions of ${secret}" secrets versions list "${secret}" \
     --project="${GOOGLE_CLOUD_PROJECT}" \
     --filter="state=ENABLED OR state=DISABLED" \
     --sort-by="~createTime" \
-    --format="value(name)" 2>/dev/null || true)
+    --format="value(name)"); then
+    echo "    !! cannot list versions -- skipping ${secret} (nothing destroyed)"
+    return
+  fi
 
   if [[ -z "${versions}" ]]; then
     echo "    no active versions found"
@@ -397,10 +493,10 @@ trim_secret_versions() {
     else
       echo "    destroying ${ver}"
       if [[ "${DRY_RUN}" != "1" ]]; then
-        gcloud secrets versions destroy "${ver}" \
+        gcloud_mutate "      " secrets versions destroy "${ver}" \
           --secret="${secret}" \
           --project="${GOOGLE_CLOUD_PROJECT}" \
-          --quiet 2>/dev/null || echo "      (skipped)"
+          --quiet || true
       fi
     fi
   done <<< "${versions}"
@@ -427,9 +523,12 @@ trim_build_buckets() {
   local age="${BUCKET_AGE_DAYS:-30}"
 
   local buckets
-  buckets=$(gcloud storage buckets list \
+  if ! buckets=$(gcloud_query "storage buckets" storage buckets list \
     --project="${GOOGLE_CLOUD_PROJECT}" \
-    --format="value(name)" 2>/dev/null || true)
+    --format="value(name)"); then
+    echo "  !! cannot list buckets -- skipping storage (no rules set)"
+    return 0
+  fi
 
   if [[ -z "${buckets}" ]]; then
     echo "  no buckets found"
@@ -450,9 +549,12 @@ trim_build_buckets() {
 
     # Already has a lifecycle rule? Leave it be (idempotent across runs).
     local existing
-    existing=$(gcloud storage buckets describe "gs://${bucket}" \
+    if ! existing=$(gcloud_query "describe gs://${bucket}" storage buckets describe "gs://${bucket}" \
       --project="${GOOGLE_CLOUD_PROJECT}" \
-      --format="value(lifecycle_config.rule)" 2>/dev/null || true)
+      --format="value(lifecycle_config.rule)"); then
+      echo "  skipping  gs://${bucket}  (cannot read its lifecycle config)"
+      continue
+    fi
     if [[ -n "${existing}" ]]; then
       echo "  keeping   gs://${bucket}  (lifecycle rule already set)"
       continue
@@ -463,10 +565,10 @@ trim_build_buckets() {
       local lc
       lc="$(mktemp)"
       printf '{"rule":[{"action":{"type":"Delete"},"condition":{"age":%d}}]}' "${age}" > "${lc}"
-      gcloud storage buckets update "gs://${bucket}" \
+      gcloud_mutate "      " storage buckets update "gs://${bucket}" \
         --lifecycle-file="${lc}" \
         --project="${GOOGLE_CLOUD_PROJECT}" \
-        --quiet 2>/dev/null || echo "      (skipped)"
+        --quiet || true
       rm -f "${lc}"
     fi
   done <<< "${buckets}"
@@ -503,7 +605,7 @@ if [[ -n "${SERVICE_NAME:-}" ]]; then
   trim_build_buckets
 
   echo ""
-  echo "=== Done ==="
+  finish
   exit 0
 fi
 
@@ -516,12 +618,11 @@ echo ""
 # --- Cloud Run ---
 echo "=== Cloud Run ==="
 
-SERVICES=$(gcloud run services list \
+if ! SERVICES=$(gcloud_query "Cloud Run services" run services list \
   --project="${GOOGLE_CLOUD_PROJECT}" \
-  --format="csv[no-heading](metadata.name,metadata.labels.'cloud.googleapis.com/location')" \
-  2>/dev/null || true)
-
-if [[ -z "${SERVICES}" ]]; then
+  --format="csv[no-heading](metadata.name,metadata.labels.'cloud.googleapis.com/location')"); then
+  echo "  !! cannot list services -- skipping Cloud Run (nothing deleted)"
+elif [[ -z "${SERVICES}" ]]; then
   echo "  no services found"
 else
   while IFS=, read -r svc svc_region; do
@@ -541,10 +642,14 @@ echo ""
 # --- Artifact Registry ---
 echo "=== Artifact Registry ==="
 
-REPOS=$(gcloud artifacts repositories list \
+if ! REPOS_JSON=$(gcloud_query "Artifact Registry repositories" artifacts repositories list \
   --project="${GOOGLE_CLOUD_PROJECT}" \
-  --format="json" 2>/dev/null \
-  | python3 -c "
+  --format="json"); then
+  REPOS_JSON=""
+  AR_UNREADABLE=1
+fi
+
+REPOS=$(printf '%s' "${REPOS_JSON:-[]}" | python3 -c "
 import json, sys
 for r in json.load(sys.stdin):
     parts = r.get('name','').split('/')
@@ -558,23 +663,29 @@ for r in json.load(sys.stdin):
     print(location + ',' + repo_id)
 " || true)
 
-if [[ -z "${REPOS}" ]]; then
+if [[ -n "${AR_UNREADABLE:-}" ]]; then
+  echo "  !! cannot list repositories -- skipping Artifact Registry (nothing deleted)"
+elif [[ -z "${REPOS}" ]]; then
   echo "  no repositories found"
 else
   while IFS=, read -r repo_location repo_id; do
     [[ -z "${repo_id}" ]] && continue
     image_base="${repo_location}-docker.pkg.dev/${GOOGLE_CLOUD_PROJECT}/${repo_id}"
 
-    images=$(gcloud artifacts docker images list "${image_base}" \
+    if ! images_json=$(gcloud_query "images in ${repo_id}" artifacts docker images list "${image_base}" \
       --project="${GOOGLE_CLOUD_PROJECT}" \
-      --format="json" \
-      2>/dev/null | python3 -c "
+      --format="json"); then
+      echo "  ${repo_id}: !! cannot list images -- skipped (nothing deleted)"
+      continue
+    fi
+
+    images=$(printf '%s' "${images_json:-[]}" | python3 -c "
 import json, sys
 imgs = json.load(sys.stdin)
 names = set(i['package'] for i in imgs if i.get('package'))
 for n in sorted(names):
     print(n)
-" 2>/dev/null || true)
+")
 
     if [[ -z "${images}" ]]; then
       echo "  ${repo_id}: no images"
@@ -593,10 +704,14 @@ echo ""
 # --- Legacy Container Registry (GCR bridge repos) ---
 echo "=== Legacy Container Registry ==="
 
-GCR_REPOS=$(gcloud artifacts repositories list \
+if ! GCR_JSON=$(gcloud_query "Artifact Registry repositories (GCR bridge)" artifacts repositories list \
   --project="${GOOGLE_CLOUD_PROJECT}" \
-  --format="json" 2>/dev/null \
-  | python3 -c "
+  --format="json"); then
+  GCR_JSON=""
+  GCR_UNREADABLE=1
+fi
+
+GCR_REPOS=$(printf '%s' "${GCR_JSON:-[]}" | python3 -c "
 import json, sys
 proj = sys.argv[1]
 for r in json.load(sys.stdin):
@@ -607,7 +722,9 @@ for r in json.load(sys.stdin):
         print(repo_id + '/' + proj)
 " "${GOOGLE_CLOUD_PROJECT}" || true)
 
-if [[ -z "${GCR_REPOS}" ]]; then
+if [[ -n "${GCR_UNREADABLE:-}" ]]; then
+  echo "  !! cannot list repositories -- skipping legacy GCR (nothing deleted)"
+elif [[ -z "${GCR_REPOS}" ]]; then
   echo "  no GCR bridge repos found"
 else
   while IFS= read -r gcr_repo; do
@@ -622,11 +739,11 @@ echo ""
 # --- Secret Manager ---
 echo "=== Secret Manager ==="
 
-ALL_SECRETS=$(gcloud secrets list \
+if ! ALL_SECRETS=$(gcloud_query "Secret Manager secrets" secrets list \
   --project="${GOOGLE_CLOUD_PROJECT}" \
-  --format="value(name)" 2>/dev/null || true)
-
-if [[ -z "${ALL_SECRETS}" ]]; then
+  --format="value(name)"); then
+  echo "  !! cannot list secrets -- skipping Secret Manager (nothing destroyed)"
+elif [[ -z "${ALL_SECRETS}" ]]; then
   echo "  no secrets found"
 else
   while IFS= read -r secret_name; do
@@ -642,4 +759,4 @@ echo "=== Cloud Storage ==="
 trim_build_buckets
 
 echo ""
-echo "=== Done ==="
+finish
