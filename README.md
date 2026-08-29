@@ -14,6 +14,46 @@ and query only the relevant services.
 
 ## Scripts
 
+### `cleanup-scan.py` — fleet triage: which projects need a cleanup
+
+```bash
+uv run cleanup-scan.py            # scan every project across all gcloud configs
+./cleanup-scan.py PROJECT …       # scan only the named projects
+./cleanup-scan.py --all           # also list projects that are already clean
+./cleanup-scan.py --keep 5 --workers 12
+```
+
+Read-only. It never deletes anything — it just answers "which projects would
+repay a `cleanup-cloudrun` run?" so you can spend cleanup effort where it counts.
+
+For every project reachable from your gcloud configs (discovery spans both
+accounts) it counts what is deletable beyond the keep-count in each category
+`cleanup-cloudrun` handles — Cloud Run revisions, App Engine versions (a version
+serving traffic is never counted), Artifact Registry image versions and repo
+footprint, Secret Manager versions — plus build-scratch buckets missing a
+lifecycle rule and a non-empty legacy `us.artifacts.<project>.appspot.com`
+bucket (which points you at `gcr-prune-orphans.py`). Projects with anything to
+reclaim print first, ranked so the ones carrying real image storage lead, each
+with the exact command to run:
+
+```
+━━━ Projects ready for cleanup ━━━
+
+  trinket-merge-test   33 excess AR images, 28.0GB AR footprint, 40 excess Cloud Run revisions
+  trinket-uindy        5 excess AR images, 6.0GB AR footprint, 5 excess Cloud Run revisions
+  glowscript-py38      1.6GB AR footprint, legacy GCR bucket (→ gcr-prune-orphans)
+
+  Run (dry-run first):
+    CLOUDSDK_ACTIVE_CONFIG_NAME=assets cleanup-cloudrun trinket-merge-test --dry-run
+    …
+```
+
+Scans run in a thread pool (default 8 projects at once); a full ~26-project
+fleet takes about 30 seconds. A single-file [PEP 723](https://peps.python.org/pep-0723/)
+uv script — stdlib-only, no dependencies.
+
+---
+
 ### `gcp-cost-report.sh` — per-project storage cost report
 
 ```bash
@@ -133,4 +173,5 @@ ln -s /Users/steve/Development/gcp-tools/gcp-cost-report.sh ~/bin/gcp-cost-repor
 ln -s /Users/steve/Development/gcp-tools/cleanup-cloudrun.sh ~/bin/cleanup-cloudrun
 ln -s /Users/steve/Development/gcp-tools/gcp-bucket-summary.sh ~/bin/gcp-bucket-summary
 ln -s /Users/steve/Development/gcp-tools/gcr-prune-orphans.py ~/bin/gcr-prune-orphans
+ln -s /Users/steve/Development/gcp-tools/cleanup-scan.py ~/bin/cleanup-scan
 ```
