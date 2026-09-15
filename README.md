@@ -171,10 +171,18 @@ stdlib-only, no dependencies. Runs under `uv` (pinned interpreter) or plain
 
 ### Install to PATH
 
+Paths are `$HOME`-relative so the same commands work on every machine — the
+account name is not always `steve`, and a hardcoded `/Users/steve` silently
+creates dead links elsewhere.
+
 ```bash
-ln -s /Users/steve/Development/gcp-tools/gcp-cost-report.sh ~/bin/gcp-cost-report
-ln -s /Users/steve/Development/gcp-tools/cleanup-cloudrun.sh ~/bin/cleanup-cloudrun
-ln -s /Users/steve/Development/gcp-tools/gcp-bucket-summary.sh ~/bin/gcp-bucket-summary
-ln -s /Users/steve/Development/gcp-tools/gcr-prune-orphans.py ~/bin/gcr-prune-orphans
-ln -s /Users/steve/Development/gcp-tools/cleanup-scan.py ~/bin/cleanup-scan
+mkdir -p ~/bin   # and make sure it is on your PATH
+ln -s "$HOME/Development/gcp-tools/gcp-cost-report.sh"    ~/bin/gcp-cost-report
+ln -s "$HOME/Development/gcp-tools/cleanup-cloudrun.sh"   ~/bin/cleanup-cloudrun
+ln -s "$HOME/Development/gcp-tools/gcp-bucket-summary.sh" ~/bin/gcp-bucket-summary
+ln -s "$HOME/Development/gcp-tools/gcr-prune-orphans.py"  ~/bin/gcr-prune-orphans
+ln -s "$HOME/Development/gcp-tools/cleanup-scan.py"       ~/bin/cleanup-scan
 ```
+
+Check them with `ls -l ~/bin | grep gcp-tools` — a link whose target does not
+resolve prints in red / shows a missing target.
