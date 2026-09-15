@@ -31,15 +31,18 @@ accounts) it counts what is deletable beyond the keep-count in each category
 `cleanup-cloudrun` handles — Cloud Run revisions, App Engine versions (a version
 serving traffic is never counted), Artifact Registry image versions and repo
 footprint, Secret Manager versions — plus build-scratch buckets missing a
-lifecycle rule and a non-empty legacy `us.artifacts.<project>.appspot.com`
-bucket (which points you at `gcr-prune-orphans.py`). Projects with anything to
-reclaim print first, ranked so the ones carrying real image storage lead, each
+lifecycle rule (sized with `du -s`, since one un-swept `_cloudbuild` bucket can
+hold more than every image in the project) and a non-empty legacy
+`us.artifacts.<project>.appspot.com` bucket (which points you at
+`gcr-prune-orphans.py`). Projects with anything to reclaim print first, ranked
+by total reclaimable storage — AR footprint plus build-scratch bytes — each
 with the exact command to run:
 
 ```
 ━━━ Projects ready for cleanup ━━━
 
   trinket-merge-test   33 excess AR images, 28.0GB AR footprint, 40 excess Cloud Run revisions
+  instructormi4edtest  1 build bucket(s) w/o lifecycle (25.2GB)
   trinket-uindy        5 excess AR images, 6.0GB AR footprint, 5 excess Cloud Run revisions
   glowscript-py38      1.6GB AR footprint, legacy GCR bucket (→ gcr-prune-orphans)
 

@@ -9,7 +9,8 @@ Read-only fleet scanner. It NEVER deletes anything. For every project reachable
 from your gcloud configs it counts what is deletable beyond the keep-count in
 each category `cleanup-cloudrun` handles — Cloud Run revisions, App Engine
 versions, Artifact Registry image versions, Secret Manager versions — plus
-build-scratch buckets missing a lifecycle rule and the presence of a legacy GCR
+build-scratch buckets missing a lifecycle rule (and the bytes they hold) and
+the presence of a legacy GCR
 bucket (which usually holds orphaned blobs for `gcr-prune-orphans.py`). Projects
 with anything to reclaim are listed first, ranked so the ones carrying real
 image storage lead, each with the exact command to run.
@@ -265,13 +266,38 @@ def scan_secrets(project, config, secret_keep):
     return excess, len(names)
 
 
+def bucket_bytes(bucket, project, config):
+    """Total bytes in a bucket, or 0 if it cannot be sized.
+
+    `du -s` walks every object, so this is called only on the handful of
+    build-scratch buckets already known to lack a lifecycle rule — never on the
+    whole bucket list. A timeout or error degrades to 0: an unsized bucket is
+    still reported as missing its rule, just without bytes behind it.
+    """
+    rc, out, _ = gcloud(["storage", "du", "-s", f"gs://{bucket}",
+                         f"--project={project}"], config)
+    if rc != 0:
+        return 0
+    # Output is "<bytes>  gs://<bucket>".
+    try:
+        return int(out.split()[0])
+    except (IndexError, ValueError):
+        return 0
+
+
 def scan_build_buckets(project, config):
-    """Count build-scratch buckets that lack any lifecycle rule."""
+    """Count build-scratch buckets lacking a lifecycle rule, and size them.
+
+    The bytes are what setting the rule would eventually reclaim. They can dwarf
+    a project's entire AR footprint — an un-swept `_cloudbuild` bucket grows by
+    one source tarball per build, forever — so they feed the ranking score
+    rather than being reported as a bare bucket count.
+    """
     rc, out, _ = gcloud(["storage", "buckets", "list", f"--project={project}",
                          "--format=value(name)"], config)
     if rc != 0 or not out.strip():
-        return 0
-    missing = 0
+        return 0, 0
+    missing, total = 0, 0
     for bucket in out.split():
         is_build = (bucket.endswith(BUILD_BUCKET_SUFFIXES)
                     or bucket.startswith(BUILD_BUCKET_PREFIXES))
@@ -283,7 +309,8 @@ def scan_build_buckets(project, config):
                       timeout=30)[1]
         if not rule.strip():
             missing += 1
-    return missing
+            total += bucket_bytes(bucket, project, config)
+    return missing, total
 
 
 # ---------------------------------------------------------------------------
@@ -310,14 +337,18 @@ def scan_project(project, config, keep, secret_keep):
     # enabled-APIs list even where buckets exist and are describable, so the
     # bucket checks run unconditionally (the calls fail cleanly if truly absent).
     f["gcr_bucket"] = scan_legacy_gcr(project, config)
-    f["buckets_no_lifecycle"] = scan_build_buckets(project, config)
+    f["buckets_no_lifecycle"], f["bucket_bytes"] = scan_build_buckets(project, config)
 
     f["excess_total"] = (f["run_excess"] + f["ae_excess"] + f["ar_excess"]
                          + f["secret_excess"] + f["buckets_no_lifecycle"])
     f["ready"] = f["excess_total"] > 0 or f["gcr_bucket"]
-    # Rank: real image storage first (AR footprint, then legacy-GCR presence),
-    # then raw excess-item count.
-    f["score"] = (f["ar_bytes"], 1 if f["gcr_bucket"] else 0, f["excess_total"])
+    # Rank: reclaimable storage first, then legacy-GCR presence, then raw
+    # excess-item count. Build-scratch bytes join the AR footprint in that first
+    # term because a single un-swept _cloudbuild bucket can outweigh every image
+    # in the project — ranking on AR alone buried a 27GB bucket near the bottom.
+    f["score"] = (f["ar_bytes"] + f["bucket_bytes"],
+                  1 if f["gcr_bucket"] else 0,
+                  f["excess_total"])
     return f
 
 
@@ -336,7 +367,8 @@ def reason(f):
     if f["secret_excess"]:
         bits.append(f"{f['secret_excess']} excess secret versions")
     if f["buckets_no_lifecycle"]:
-        bits.append(f"{f['buckets_no_lifecycle']} build bucket(s) w/o lifecycle")
+        size = f" ({human_bytes(f['bucket_bytes'])})" if f["bucket_bytes"] else ""
+        bits.append(f"{f['buckets_no_lifecycle']} build bucket(s) w/o lifecycle{size}")
     return ", ".join(bits) if bits else "nothing to reclaim"
 
 
