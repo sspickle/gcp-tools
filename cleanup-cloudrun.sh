@@ -298,6 +298,22 @@ fi
 # Confirm account+project before destructive operations.
 # Set GCLOUD_ACCOUNT_OK=1 to skip (e.g. in CI or when piping output).
 if [[ -z "${GCLOUD_ACCOUNT_OK:-}" ]]; then
+  # bash prints a `read -p` prompt only to a terminal, so under a pipe, CI or a
+  # tool harness this read blocks forever with nothing on screen explaining why
+  # -- the same invisible-prompt footgun cleanup-scan.py guards against with
+  # stdin=DEVNULL. Fail loudly instead of hanging.
+  if [[ ! -t 0 ]]; then
+    echo "" >&2
+    echo "stdin is not a terminal, so the account/project confirmation cannot be" >&2
+    echo "shown or answered. Re-run from a terminal, or set GCLOUD_ACCOUNT_OK=1 to" >&2
+    echo "confirm up front:" >&2
+    echo "" >&2
+    echo "  GCLOUD_ACCOUNT_OK=1 cleanup-cloudrun ${GOOGLE_CLOUD_PROJECT}${DRY_RUN:+ --dry-run}" >&2
+    echo "" >&2
+    echo "Account: ${_ACTIVE_ACCOUNT:-unknown} (config: ${_ACTIVE_CONFIG:-unknown})" >&2
+    echo "Project: ${GOOGLE_CLOUD_PROJECT}" >&2
+    exit 1
+  fi
   read -r -p "Proceed with this account and project? [y/N] " _CONFIRM
   if [[ "${_CONFIRM}" != "y" && "${_CONFIRM}" != "Y" ]]; then
     echo "Aborted."
